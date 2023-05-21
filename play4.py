@@ -1,0 +1,672 @@
+import collections
+import pathlib
+import threading
+import time
+import traceback
+from typing import List, Union, Optional, Dict
+
+import chess
+import chess.engine
+import chess.pgn as pgn
+import chess.svg
+import numpy as np
+import torch
+from PyQt5 import QtGui
+from PyQt5.QtCore import Qt, QSettings, QSize, QPoint
+from PyQt5.QtGui import QFontDatabase, QColorConstants
+from PyQt5.QtSvg import QSvgWidget
+from PyQt5.QtWidgets import QApplication, QWidget, QListWidget, QListWidgetItem, QPushButton
+
+from train4 import EvaluationModel, Converter
+
+# Define piece values for material count evaluation
+PIECE_VALUES = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
+
+
+class GameState:
+    board: chess.Board
+    scores: List[str]
+    white_captures: List[chess.Piece]
+    black_captures: List[chess.Piece]
+
+    def __init__(self, board: chess.Board, scores: Optional[List[str]] = None):
+        self.board = board.copy()
+        self.scores = scores or []
+        self.white_captures = []
+        self.black_captures = []
+        board = self.board.copy()
+        while board.move_stack:
+            move = board.pop()
+            if board.is_capture(move):
+                if board.is_en_passant(move):
+                    down = -8 if board.turn == chess.WHITE else 8
+                    piece = board.piece_at(move.to_square + down)
+                else:
+                    piece = board.piece_at(move.to_square)
+                if piece.color == chess.BLACK:
+                    self.white_captures.append(piece)
+                else:
+                    self.black_captures.append(piece)
+        self.white_captures.reverse()
+        self.black_captures.reverse()
+
+
+class MoveOption(object):
+    def __init__(self, board: chess.Board, moves: List[chess.Move]):
+        self.moves: List[chess.Move] = moves
+        self.scores = [float("nan")] * len(moves)
+        self.boards = []
+        board = board.copy()
+        for move in self.moves:
+            board.push(move)
+            self.boards.append(board.copy())
+
+    def pop_move(self):
+        self.moves.pop()
+        self.scores.pop()
+        self.boards.pop()
+
+    def set_score(self, move, score):
+        self.scores[self.moves.index(move)] = score
+
+    def get_my_scores(self):
+        return self.scores[::2]
+
+    def get_(self):
+        return self.scores[1::2]
+
+
+class PlayThread(threading.Thread):
+    def __init__(self, model_path: Union[str, pathlib.Path], depth: int, device: str, playing_as: chess.Color):
+        super().__init__(daemon=True)
+        self.depth = depth
+        if model_path:
+            self.model = EvaluationModel.load_from_checkpoint(model_path)
+            self.device = torch.device(device)
+            print(f"Inference device {self.device}")
+            self.model.to(self.device)
+            self.model.freeze()
+            self.model.eval()
+        else:
+            self.model = None
+        self.game_states = [
+            GameState(
+                chess.Board(),
+            )
+        ]
+        self.start()
+        self.event = threading.Event()
+        self.playing_as: chess.Color = playing_as
+
+    def restart(self):
+        self.event.set()
+
+    def run(self) -> None:
+        engine = chess.engine.SimpleEngine.popen_uci(r"D:\stockfish-windows-2022-x86-64-avx2.exe")
+        with engine:
+            engine.configure({"Skill Level": 1})
+            while True:
+                self.event.clear()
+                self.game_states = [
+                    GameState(
+                        chess.Board(),
+                    )
+                ]
+                board = chess.Board()
+                game = pgn.Game()
+                n = 1
+                try:
+                    while not board.is_game_over() and not self.event.is_set():
+                        start_time = time.time()
+                        # print("Starting move search")
+                        best_move, best_score = self.get_best_move2(board)
+                        my_capture = " "
+                        if board.is_capture(best_move):
+                            if board.is_en_passant(best_move):
+                                down = -8 if board.turn == chess.WHITE else 8
+                                my_capture = board.piece_at(best_move.to_square + down).symbol().upper()
+                            else:
+                                my_capture = board.piece_at(best_move.to_square).symbol().upper()
+
+                        board.push(best_move)
+                        my_move_analysis = engine.analyse(board, chess.engine.Limit(time=0.1))
+                        my_actual_score = self.boards_eval(board)[0].item()
+
+                        my_move_score1 = self.to_score(self.convert_model_score(my_actual_score))
+                        my_move_score2 = self.to_score(my_move_analysis["score"].white().wdl(model="lichess").wins - 500)
+                        my_move_score3 = self.to_score(self.evaluate_board_score(board) * 10)
+
+                        self.game_states.append(GameState(board, [my_move_score1, my_move_score2, my_move_score3]))
+
+                        game = game.add_variation(best_move)
+
+                        result = engine.play(board.copy(), chess.engine.Limit(time=0.01))
+                        if result.move is None:
+                            print(result)
+                            print(result.move)
+                            continue
+
+                        if result.resigned:
+                            break
+
+                        enemy_capture = " "
+                        if board.is_capture(result.move):
+                            if board.is_en_passant(result.move):
+                                down = -8 if board.turn == chess.WHITE else 8
+                                enemy_capture = board.piece_at(result.move.to_square + down).symbol().upper()
+                            else:
+                                enemy_capture = board.piece_at(result.move.to_square).symbol().upper()
+                        board.push(result.move)
+                        game = game.add_variation(result.move)
+
+                        stockfish_analysis = engine.analyse(board, chess.engine.Limit(time=0.1))
+                        my_score = self.boards_eval(board)[0].item()
+
+                        opponent_move_score1 = self.to_score(self.convert_model_score(my_score))
+                        opponent_move_score2 = self.to_score(stockfish_analysis["score"].white().wdl(model="lichess").wins - 500)
+                        opponent_move_score3 = self.to_score(self.evaluate_board_score(board) * 10)
+
+                        duration = int(time.time() - start_time)
+
+                        self.game_states.append(GameState(board, [opponent_move_score1, opponent_move_score2, opponent_move_score3]))
+                        # print("stockfish", n, result.move, to_score(my_score), stockfish_analysis['score'].white())
+                        ##print(result.move, result.ponder, analysis['score'].white(), my_score)
+                        # print(best_score, PovScore(Cp(best_score), True), my_move_analysis['score'])
+                        print(
+                            "| %4s | %2s (%4s, %4s, %4s) | %s | %2s (%4s, %4s, %4s) | %s | %4ss"
+                            % (
+                                n,
+                                best_move.uci()[-2:],
+                                my_move_score1,
+                                my_move_score2,
+                                my_move_score3,
+                                my_capture,
+                                result.move.uci()[-2:],
+                                opponent_move_score1,
+                                opponent_move_score2,
+                                opponent_move_score3,
+                                enemy_capture,
+                                duration,
+                            )
+                        )
+                        # print(n, best_move.uci()[-2:], )
+                        n += 1
+                except Exception as e:
+                    traceback.print_exc()
+
+                print(game.root())
+                print(board.result())
+                self.event.wait()
+
+    def boards_eval(self, *boards: chess.Board) -> torch.Tensor:
+        if self.model:
+            return self.evaluate_boards_model(*boards)
+        result = []
+        for board in boards:
+            result.append(self.evaluate_board_score(board))
+        return torch.from_numpy(np.array(result))
+
+    def recursive_search(self, board, depth, maximize, alpha=-float("inf"), beta=float("inf")):
+        if depth == 0:
+            score = self.boards_eval(board)[0].item()
+            return score
+
+        if board.is_game_over():
+            outcome = board.outcome()
+            if outcome:
+                if outcome.winner == self.playing_as:
+                    return float("int")
+                return -float("inf")
+            score = self.boards_eval(board)[0].item()
+            return score
+
+        if maximize:
+            best_score = -float("inf")
+            for move in board.legal_moves:
+                board.push(move)
+                score = self.recursive_search(board, depth - 1, False, alpha, beta)
+                board.pop()
+                best_score = max(best_score, score)
+                alpha = max(alpha, best_score)
+                if beta <= alpha:
+                    break  # beta cut-off
+            return best_score
+
+        else:
+            best_score = float("inf")
+            for move in board.legal_moves:
+                board.push(move)
+                score = self.recursive_search(board, depth - 1, True, alpha, beta)
+                board.pop()
+                best_score = min(best_score, score)
+                beta = min(beta, best_score)
+                if beta <= alpha:
+                    break  # alpha cut-off
+            return best_score
+
+    def generate_legal_move_paths_at_depth(self, board, depth, so_far):
+        if depth == 0 or board.is_game_over():
+            yield so_far
+        else:
+            for move in board.generate_legal_moves():
+                board.push(move)
+                for moves in self.generate_legal_move_paths_at_depth(board, depth - 1, so_far + [move]):
+                    yield moves
+                board.pop()
+
+    def get_best_move(self, board):
+        original_board = board.copy()
+        move_options = []
+        for move in board.legal_moves:
+            board.push(move)
+
+            # Short-circuit.
+            if board.is_checkmate():
+                return move, float("inf")
+
+            # Don't make moves that allow other side claiming a draw.
+            if board.can_claim_draw():
+                board.pop()
+                continue
+
+            paths = list(self.generate_legal_move_paths_at_depth(board, self.depth, [move]))
+
+            move_options.extend([MoveOption(original_board, path) for path in paths])
+
+            board.pop()
+
+        print(f"Got {len(move_options)} final paths")
+
+        path_starts = [option.boards[0] for option in move_options]
+        start_scores = []
+        path_start_evals = self.boards_eval(*path_starts)
+        for i, path_start_score in enumerate(path_start_evals.numpy()):
+            option = move_options[i]
+            option.set_score(option.moves[0], path_start_score[0])
+            start_scores.append(path_start_score[0])
+
+        path_ends = [option.boards[-1] for option in move_options]
+        path_end_evals = self.boards_eval(*path_ends)
+        end_scores = []
+        for i, path_end_score in enumerate(path_end_evals.numpy()):
+            option = move_options[i]
+            option.set_score(option.moves[-1], path_end_score[0])
+            end_scores.append(path_end_score[0])
+
+        end_scores = np.array(end_scores)
+
+        # Sort move options by the end score
+        move_options.sort(key=lambda x: x.scores[-1], reverse=True)
+
+        # Take N best moves, and evaluate all the other in-between steps for the paths, except the last
+        # (which is already evaluated)
+        candidate_options = move_options[:200]
+        boards = []
+        option_and_moves_for_board = []
+        for option in candidate_options:
+            boards.extend(option.boards[:-1])
+
+            option_and_moves_for_board.extend([(option, move) for move in option.moves[:-1]])
+
+        full_path_evals = self.boards_eval(*boards)
+
+        for (option, move), score in zip(option_and_moves_for_board, full_path_evals.numpy()):
+            option.set_score(move, score[0])
+
+        least_variable = max(candidate_options, key=lambda x: np.std(x.get_my_scores()))
+        variances = [np.std(x.get_my_scores()) for x in candidate_options]
+
+        # print(f"Got score {best_score} for {best_move} {np.max(np_evals)} {np.min(np_evals)} {np.mean(np_evals)} {np_evals}")
+        print(f"{board.fullmove_number} Got score {least_variable.scores[0]:.2f} for {least_variable.moves[0]}")
+        print(
+            f"{board.fullmove_number} Got scores: {['%.2f' % x for x in least_variable.scores]} {['%.2f' % x for x in least_variable.get_my_scores()]} {[a.uci() for a in least_variable.moves]} ({np.min(end_scores):.2f}/{np.max(end_scores):.2f}/{np.mean(end_scores):.2f})"
+        )
+        print(
+            f"{board.fullmove_number} Got variances: {np.std(least_variable.scores):.2f}/{np.std(least_variable.get_my_scores()):.2f} ({np.min(variances):.2f}/{np.max(variances):.2f}/{np.mean(variances):.2f})"
+        )
+
+        return least_variable.moves[0], least_variable.scores[0]
+
+    def get_best_move2(self, board):
+        best_move = None
+        best_score = -float("inf")
+        for move in board.legal_moves:
+            board.push(move)
+
+            if board.can_claim_draw():
+                board.pop()
+                continue
+
+            if board.is_checkmate():
+                return move, float("inf")
+
+            # score = self.boards_eval(board)[0].item()
+
+            score = self.recursive_search(board, self.depth, False)
+            if score > best_score:
+                best_score = score
+                best_move = move
+
+            board.pop()
+
+        return best_move, best_score
+
+    def get_best_move3(self, board):
+        original_board = board.copy()
+        move_options = []
+        for move in board.legal_moves:
+            board.push(move)
+
+            # Short-circuit.
+            if board.is_checkmate():
+                return move, float("inf")
+
+            # Don't make moves that allow other side claiming a draw.
+            if board.can_claim_draw():
+                board.pop()
+                continue
+
+            paths = list(self.generate_legal_move_paths_at_depth(board, self.depth, [move]))
+
+            move_options.extend([MoveOption(original_board, path) for path in paths])
+
+            board.pop()
+
+        print(f"Got {len(move_options)} final paths")
+
+        options_by_depth: Dict[int, List[MoveOption]] = collections.defaultdict(list)
+        for option in move_options:
+            options_by_depth[len(option.moves)].append(option)
+
+        path_starts = [option.boards[0] for option in move_options]
+        start_scores = []
+        path_start_evals = self.boards_eval(*path_starts)
+        for i, path_start_score in enumerate(path_start_evals.numpy()):
+            option = move_options[i]
+            option.set_score(option.moves[0], path_start_score[0])
+            start_scores.append(path_start_score[0])
+
+        path_ends = [option.boards[-1] for option in move_options]
+        path_end_evals = self.boards_eval(*path_ends)
+        end_scores = []
+        for i, path_end_score in enumerate(path_end_evals.numpy()):
+            option = move_options[i]
+            option.set_score(option.moves[-1], path_end_score[0])
+            end_scores.append(path_end_score[0])
+
+        end_scores = np.array(end_scores)
+
+        # Sort move options by the end score
+        move_options.sort(key=lambda x: x.scores[-1], reverse=True)
+
+        # Take N best moves, and evaluate all the other in-between steps for the paths, except the last
+        # (which is already evaluated)
+        candidate_options = move_options[:200]
+        boards = []
+        option_and_moves_for_board = []
+        for option in candidate_options:
+            boards.extend(option.boards[:-1])
+
+            option_and_moves_for_board.extend([(option, move) for move in option.moves[:-1]])
+
+        full_path_evals = self.boards_eval(*boards)
+
+        for (option, move), score in zip(option_and_moves_for_board, full_path_evals.numpy()):
+            option.set_score(move, score[0])
+
+        least_variable = max(candidate_options, key=lambda x: np.std(x.get_my_scores()))
+        variances = [np.std(x.get_my_scores()) for x in candidate_options]
+
+        # print(f"Got score {best_score} for {best_move} {np.max(np_evals)} {np.min(np_evals)} {np.mean(np_evals)} {np_evals}")
+        print(f"{board.fullmove_number} Got score {least_variable.scores[0]:.2f} for {least_variable.moves[0]}")
+        print(
+            f"{board.fullmove_number} Got scores: {['%.2f' % x for x in least_variable.scores]} {['%.2f' % x for x in least_variable.get_my_scores()]} {[a.uci() for a in least_variable.moves]} ({np.min(end_scores):.2f}/{np.max(end_scores):.2f}/{np.mean(end_scores):.2f})"
+        )
+        print(
+            f"{board.fullmove_number} Got variances: {np.std(least_variable.scores):.2f}/{np.std(least_variable.get_my_scores()):.2f} ({np.min(variances):.2f}/{np.max(variances):.2f}/{np.mean(variances):.2f})"
+        )
+
+        return least_variable.moves[0], least_variable.scores[0]
+
+    @staticmethod
+    def convert_model_score(value):
+        return (value - 0.5) * 1000
+        # value = Converter.white_win_chance_to_cp(value)
+        # value = PovScore(Cp(value), chess.WHITE)
+        # return value.white().wdl(model="lichess").wins - 500
+
+    @staticmethod
+    def to_score(value):
+        if value >= 0:
+            return f"+{int(value)}"
+        return str(int(value))
+
+    def evaluate_boards_model(self, *boards: chess.Board):
+        if not boards:
+            return torch.tensor([])
+
+        scores = []
+        tensor_records = []
+        for board in boards:
+            record = Converter.board_to_record(board)
+            tensor_record = Converter.record_to_tensor_record(record)["boards"]
+            tensor_records.append(tensor_record)
+
+            if len(tensor_records) == 1024 * 20:
+                scores.append(self.evaluate_tensor_records(tensor_records))
+                tensor_records.clear()
+
+        if tensor_records:
+            scores.append(self.evaluate_tensor_records(tensor_records))
+            tensor_records.clear()
+
+        return torch.concat(scores).cpu()
+
+    def evaluate_tensor_records(self, records):
+        stacked = np.stack(records)
+        torch_records = torch.from_numpy(stacked).to(self.device)
+        with torch.no_grad():
+            return self.model.forward(torch_records)
+
+    @staticmethod
+    def evaluate_board_score(board: chess.Board):
+        # Evaluate material count
+        material_count = 0
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece is not None:
+                material_count += PIECE_VALUES[piece.piece_type] * (1 if piece.color == chess.WHITE else -1)
+
+        # Evaluate piece mobility
+        mobility_count = 0
+        for move in board.legal_moves:
+            mobility_count += 1 if board.piece_at(move.from_square).piece_type != chess.PAWN else 0.5
+
+        # Evaluate pawn structure
+        pawn_structure_count = 0
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece is not None and piece.piece_type == chess.PAWN:
+                if piece.color == chess.WHITE:
+                    pawn_structure_count += (
+                        1 if square in [chess.A2, chess.B2, chess.C2, chess.D2, chess.E2, chess.F2, chess.G2, chess.H2] else 0
+                    )
+                else:
+                    pawn_structure_count -= (
+                        1 if square in [chess.A7, chess.B7, chess.C7, chess.D7, chess.E7, chess.F7, chess.G7, chess.H7] else 0
+                    )
+
+        # Evaluate king safety
+        king_square = board.king(chess.WHITE)
+        king_safety_count = 0
+        if king_square is not None:
+            # Check if king is castled
+            if king_square == chess.G1 or king_square == chess.G8:
+                king_safety_count += 1
+            # Check if king has pawn shield
+            pawn_shield = [
+                square for square in chess.SQUARES if square // 8 == king_square // 8 - 1 and abs(square % 8 - king_square % 8) <= 1
+            ]
+            if all(board.piece_at(square) is None or board.piece_at(square).piece_type == chess.PAWN for square in pawn_shield):
+                king_safety_count += 1
+
+        # Evaluate space control
+        space_count = 0
+        for square in [chess.D4, chess.E4, chess.D5, chess.E5]:
+            piece_at_square = board.piece_at(square)
+            if piece_at_square is None:
+                continue
+            if piece_at_square.color == chess.WHITE:
+                space_count += 1
+            else:
+                space_count -= 1
+
+        # Evaluate piece coordination
+        coordination_count = 0
+        for piece_type in [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]:
+            white_pieces = board.pieces(piece_type, chess.WHITE)
+            black_pieces = board.pieces(piece_type, chess.BLACK)
+            white_count = sum(1 for square in white_pieces if len(board.attacks(square)) > 0)
+            black_count = sum(1 for square in black_pieces if len(board.attacks(square)) > 0)
+            coordination_count += white_count - black_count
+
+        # Combine all factors with weights to get final evaluation score
+        evaluation = material_count
+        evaluation += 0.1 * mobility_count
+        evaluation += 0.5 * pawn_structure_count
+        evaluation += 0.2 * king_safety_count
+        evaluation += 0.2 * space_count
+        evaluation += 0.1 * coordination_count
+
+        return evaluation
+
+
+class MainWindow(QWidget):
+    def __init__(self, play_thread: PlayThread):
+        super().__init__()
+        self.play_thread = play_thread
+        self.settings = QSettings(QSettings.IniFormat, QSettings.SystemScope, "Chesser", "settings")
+        self.settings.setFallbacksEnabled(False)  # File only, not registry.
+        # setPath() to try to save to current working directory
+        self.settings.setPath(QSettings.IniFormat, QSettings.SystemScope, "./settings.ini")
+
+        self.setFixedSize(QSize(900, 600 + 55))
+        self.move(self.settings.value("pos", QPoint(100, 100)))
+
+        self.widget_svg = QSvgWidget(parent=self)
+        self.widget_svg.setGeometry(10, 5 + 30, 580, 580)
+        self.black_captures = []
+        for i in range(16):
+            capture = QSvgWidget(parent=self)
+            capture.setGeometry(10 + (30 * i), 5, 30, 30)
+            self.black_captures.append(capture)
+        self.white_captures = []
+        for i in range(16):
+            capture = QSvgWidget(parent=self)
+            capture.setGeometry(10 + (30 * i), 30 + 590, 30, 30)
+            self.white_captures.append(capture)
+
+        self.list_widget = QListWidget(parent=self)
+        self.list_widget.setGeometry(600, 5 + 30, 290, 580)
+        self.list_widget.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        self.restart_button = QPushButton(parent=self)
+
+        self.restart_button.setGeometry(800, 620, 90, 30)
+        self.restart_button.setText("Restart")
+        self.restart_button.clicked.connect(self.play_thread.restart)
+
+    def closeEvent(self, a0: QtGui.QCloseEvent) -> None:
+        self.settings.setValue("pos", self.pos())
+
+    def populate_list_widget(self):
+        if self.list_widget.count() == len(self.play_thread.game_states):
+            return
+        old_current_row = self.list_widget.currentRow()
+        is_last = old_current_row == self.list_widget.count() - 1 or old_current_row == -1
+        self.list_widget.clear()
+        for i, state in enumerate(self.play_thread.game_states):
+            if state.board.move_stack:
+                move = state.board.pop()
+                captured = " "
+                if state.board.is_capture(move):
+                    if state.board.is_en_passant(move):
+                        down = -8 if state.board.turn == chess.WHITE else 8
+                        piece = state.board.piece_at(move.to_square + down)
+                    else:
+                        piece = state.board.piece_at(move.to_square)
+                    captured = piece.symbol().upper()
+                state.board.push(move)
+                piece = state.board.piece_at(move.to_square)
+                piece_name = piece.symbol().upper()
+                score_line = ""
+                if state.scores:
+                    score_line = " | " + " | ".join(map(lambda x: f"{x:<4}", state.scores))
+                text = f"{(i+2)//2:<2} | {piece_name} | {chess.SQUARE_NAMES[move.from_square]} -> {chess.SQUARE_NAMES[move.to_square]} | {captured}{score_line}"
+                item = QListWidgetItem(text)
+                if piece.color == chess.BLACK:
+                    item.setBackground(QColorConstants.LightGray)
+            else:
+                item = QListWidgetItem("START")
+                item.setBackground(QColorConstants.Green)
+                item.setForeground(QColorConstants.Black)
+
+            self.list_widget.addItem(item)
+        if is_last:
+            if self.list_widget.currentRow() != self.list_widget.count() - 1:
+                self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+        else:
+            self.list_widget.setCurrentRow(min(old_current_row, self.list_widget.count() - 1))
+
+    def paintEvent(self, a0: QtGui.QPaintEvent) -> None:
+        try:
+            super().paintEvent(a0)
+            # Re-populate list in case we restart the game etc.
+            self.populate_list_widget()
+            if self.list_widget.currentRow() == -1:
+                return
+            state = self.play_thread.game_states[self.list_widget.currentRow()]
+            last_move = None
+            if state.board.move_stack:
+                last_move = state.board.move_stack[-1]
+            svg = chess.svg.board(state.board, lastmove=last_move).encode("UTF-8")
+            self.widget_svg.load(svg)
+            self.clear_captures()
+            for i, capture in enumerate(state.black_captures):
+                self.black_captures[i].load(chess.svg.piece(capture, 40).encode("UTF-8"))
+            for i, capture in enumerate(state.white_captures):
+                self.white_captures[i].load(chess.svg.piece(capture, 40).encode("UTF-8"))
+        except Exception:
+            traceback.print_exc()
+            raise
+
+    def clear_captures(self):
+        for i in range(16):
+            self.white_captures[i].load("")
+            self.black_captures[i].load("")
+
+    def keyPressEvent(self, evt: QtGui.QKeyEvent) -> None:
+        key = evt.key()
+        if key not in [Qt.Key_Left, Qt.Key_Up, Qt.Key_Right, Qt.Key_Down]:
+            return
+        self.populate_list_widget()
+        current = self.list_widget.currentRow()
+        if (key == Qt.Key_Left or key == Qt.Key_Up) and current > 0:
+            self.list_widget.setCurrentRow(current - 1)
+        elif (key == Qt.Key_Right or key == Qt.Key_Down) and current < self.list_widget.count() - 1:
+            self.list_widget.setCurrentRow(current + 1)
+
+
+if __name__ == "__main__":
+    app = QApplication([])
+    use_gpu = True
+    play_thread = PlayThread(
+        model_path=sorted(
+            pathlib.Path(r"logs_train4/lightning_logs/version_4/checkpoints").rglob("*.ckpt"), key=lambda x: x.stat().st_mtime
+        )[-1],
+        depth=2,
+        device="cuda" if use_gpu and torch.cuda.is_available() else "cpu",
+        playing_as=chess.WHITE,
+    )
+    window = MainWindow(play_thread)
+    window.show()
+    app.exec()

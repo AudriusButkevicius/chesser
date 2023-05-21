@@ -1,0 +1,22 @@
+#[repr(C, packed)]
+pub struct Record {
+    pub white: u64,
+    pub pawns: u64,
+    pub knights: u64,
+    pub bishops: u64,
+    pub rooks: u64,
+    pub queens: u64,
+    pub kings: u64,
+    pub turn: u8,
+    pub moves: u16,
+    pub half_moves: u16,
+    pub ep_square: u8,
+    pub promoted: u64,
+    pub castling_rights: u64,
+    pub score: f32,
+    pub mate: u8,
+    pub white_elo: u16,
+    pub black_elo: u16,
+    pub file_index: u8,
+    pub game_index: u32,
+}

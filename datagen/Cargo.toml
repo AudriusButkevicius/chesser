@@ -1,0 +1,18 @@
+[package]
+name = "chess-datagen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shakmaty = "0.24"
+hhmmss = "0.1"
+pgn-reader = "0.23.0"
+crossbeam = "0.8"
+bzip2 = "0.4"
+xz2 = "0.1"
+flate2 = "1.0"
+lz4 = "1.23"
+zstd = "0.12"
+byte-unit = "4.0.19"
+regex = "1"
+lazy_static = "1.4.0"
